@@ -1,36 +1,33 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Booth
 
-## Getting Started
+A Next.js video room powered by the Vonage Video API. Two people open the same room URL in separate browsers and join one call.
 
-First, run the development server:
+## Setup
+
+1. In the [Vonage dashboard](https://dashboard.vonage.com/), open your video project and copy the project API key and project secret.
+2. Put them in `.env`:
+
+```
+PROJECT_API_KEY=your-project-api-key
+PROJECT_SECRET=your-project-secret
+```
+
+3. Start the app:
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000). Restart the dev server after changing `.env.local`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Make a call
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. Enter your name and a room name, then open the room.
+2. Copy the room link.
+3. Open that link in a second browser (or on another device) and enter the other person's name.
 
-## Learn More
+Both browsers join the same Vonage session. Before a frame is sent, this app encrypts the audio and video with AES-CTR in the browser. The other browser decrypts those frames before they are played. Vonage only carries the encrypted media. The key is the `#k=` part of the room link, so copy that full link. It is not sent to the app server. After this cipher changes, reload both browsers and copy the room link again.
 
-To learn more about Next.js, take a look at the following resources:
+A laptop often allows only one browser to use the camera at a time. Use two devices, or a second camera, when you want video on both sides. The browser that cannot get the camera can still watch and listen.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Room names are remembered in `data/sessions.json` so both browsers attach to the same session. That file is local to this server process and is not a substitute for a database if you deploy more than one instance.

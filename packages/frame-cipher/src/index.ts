@@ -5,6 +5,7 @@ export {
   MEDIA_KEY_BYTES,
   decodeMediaKey,
   encodeMediaKey,
+  deriveKeyFromPassphrase,
   ensureMediaKey,
   generateMediaKey,
   mediaKeyFingerprint,
@@ -20,6 +21,7 @@ export { WORKER_SOURCE } from "./worker-source.js";
 
 export type {
   CipherAlgorithm,
+  CipherState,
   CipherKind,
   CipherLogEntry,
   CipherLogEvent,
@@ -28,5 +30,6 @@ export type {
   CipherStream,
   FrameCipherOptions,
   FrameCipherSupport,
+  HeaderPolicy,
   KeyMismatch,
 } from "./types.js";

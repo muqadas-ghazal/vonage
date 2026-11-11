@@ -2,6 +2,7 @@ import { CipherLog, EMPTY_SNAPSHOT, type CipherSnapshot } from "./log.js";
 import { WORKER_SOURCE } from "./worker-source.js";
 import type {
   CipherKind,
+  CipherState,
   HeaderPolicy,
   CipherOp,
   CipherStream,
@@ -79,6 +80,17 @@ export type FrameCipher = {
   isVerbose(): boolean;
   getStreams(): CipherStream[];
   /**
+   * Turn encryption on with this secret, or pass null to go back to sending in the clear.
+   * Takes effect on the next frame — no renegotiation, no interruption to the call.
+   */
+  setKey(key: Uint8Array | null): void;
+  /** Seal outgoing frames or not. Receiving is unaffected: a held key always decrypts. */
+  setSending(value: boolean): void;
+  /** What the UI needs: do we hold a key, are we sealing, and are remote streams locked. */
+  state(): CipherState;
+  /** The state of the stream carrying a given media track, for marking one tile. */
+  trackState(trackId: string): "secured" | "locked" | "plaintext" | "unknown";
+  /**
    * Advance the key ratchet. Every participant must ratchet for the call to keep working,
    * so drive this from a membership event all of them observe (someone joined or left).
    * With forwardSecrecy on, frames from generations older than the grace window become
@@ -100,7 +112,7 @@ export type FrameCipher = {
 export function createFrameCipher(options: FrameCipherOptions): FrameCipher {
   const support = frameCipherSupport();
   if (!support.supported) throw new Error(`frame-cipher: ${support.reason}`);
-  if (options.key.byteLength !== 32) {
+  if (options.key && options.key.byteLength !== 32) {
     throw new Error(`frame-cipher: key must be 32 bytes, got ${options.key.byteLength}.`);
   }
 
@@ -118,6 +130,7 @@ export function createFrameCipher(options: FrameCipherOptions): FrameCipher {
   const log = new CipherLog(useConsole);
 
   let verbose = options.verbose ?? false;
+  let lastState = "";
   let generation = 0;
   let nextStreamId = 1;
   let worker: Worker | null = null;
@@ -125,7 +138,8 @@ export function createFrameCipher(options: FrameCipherOptions): FrameCipher {
   let destroyed = false;
   let mismatchSeen = false;
 
-  const rootSecret = toArrayBuffer(options.key);
+  let rootSecret: ArrayBuffer | null = options.key ? toArrayBuffer(options.key) : null;
+  let sending = Boolean(options.key) && options.sending !== false;
   let reportedKeyId: string | null = null;
 
   function ensureWorker(): Worker {
@@ -147,7 +161,11 @@ export function createFrameCipher(options: FrameCipherOptions): FrameCipher {
       if (data.type === "cipher-open" && typeof data.keyId === "string") {
         reportedKeyId = data.keyId;
       }
+      if (data.type === "cipher-key-set") {
+        reportedKeyId = typeof data.keyId === "string" ? data.keyId : null;
+      }
       const entry = log.handle(data);
+      announceState();
       if (!entry) return;
       options.onLog?.(entry);
       if (entry.event.type === "key-mismatch" && !mismatchSeen) {
@@ -173,19 +191,24 @@ export function createFrameCipher(options: FrameCipherOptions): FrameCipher {
     try {
       const streamId = nextStreamId;
       nextStreamId += 1;
+      // The receiver's track id is the only handle shared with the video SDK's own
+      // objects, so it is what lets a tile ask about its own stream.
+      const trackId = endpoint.track?.id ?? "";
       endpoint.transform = new RTCRtpScriptTransform(ensureWorker(), {
         op,
         kind,
         streamId,
+        trackId,
         scheduleId,
         senderId: toArrayBuffer(senderIdBytes),
         fullFrame,
         generation,
+        sending,
         forwardSecrecy: options.forwardSecrecy !== false,
         generationGrace: options.generationGrace ?? 2,
         sampleFrames,
         verbose,
-        rootSecret: rootSecret.slice(0),
+        rootSecret: rootSecret ? rootSecret.slice(0) : null,
       });
     } catch {
       // A sender can refuse a transform until the connection is further along.
@@ -217,6 +240,54 @@ export function createFrameCipher(options: FrameCipherOptions): FrameCipher {
     setParameters?: RTCRtpSender["setParameters"];
   };
   let patches: Patches | null = null;
+
+  /** Publishes the state only when it differs, so stats flushes are cheap. */
+  function announceState() {
+    if (!options.onStateChange) return;
+    const next = describeState();
+    const encoded = JSON.stringify(next);
+    if (encoded === lastState) return;
+    lastState = encoded;
+    options.onStateChange(next);
+  }
+
+  /** What is happening on the stream carrying this media track, right now. */
+  function trackState(trackId: string): "secured" | "locked" | "plaintext" | "unknown" {
+    const match = log
+      .snapshot()
+      .streams.filter((s) => s.trackId === trackId && s.op === "decrypt" && s.open)
+      .filter((s) => s.recentSecured + s.recentLocked + s.recentPlaintext > 0);
+    if (match.length === 0) return "unknown";
+    if (match.some((s) => s.recentSecured > 0)) return "secured";
+    if (match.some((s) => s.recentLocked > 0)) return "locked";
+    return "plaintext";
+  }
+
+  function describeState(): CipherState {
+    const streams = log.snapshot().streams;
+    const inbound = streams.filter((stream) => stream.op === "decrypt" && stream.open);
+    const active = inbound.filter(
+      (s) => s.recentSecured + s.recentLocked + s.recentPlaintext > 0,
+    );
+    return {
+      hasKey: rootSecret !== null,
+      sending,
+      keyId: reportedKeyId,
+      generation,
+      /**
+       * Judged on the latest reporting window, not on totals: a stream that decrypted
+       * fine earlier can become locked later, and that has to surface rather than
+       * leaving the picture silently frozen.
+       *
+       * Only streams that actually carried a frame in that window count. Renegotiation
+       * leaves idle transforms behind, and counting those as "in the clear" would warn
+       * about plaintext on a call where every live stream is sealed.
+       */
+      lockedStreams: active.filter((s) => s.recentLocked > 0 && s.recentSecured === 0).length,
+      securedStreams: active.filter((s) => s.recentSecured > 0).length,
+      plaintextStreams: active.filter((s) => s.recentPlaintext > 0 && s.recentSecured === 0).length,
+    };
+  }
 
   function install() {
     if (patches || destroyed) return;
@@ -305,6 +376,30 @@ export function createFrameCipher(options: FrameCipherOptions): FrameCipher {
     },
     isVerbose: () => verbose,
     getStreams: () => log.snapshot().streams,
+    setKey(key) {
+      if (destroyed) return;
+      if (key && key.byteLength !== 32) {
+        throw new Error(`frame-cipher: key must be 32 bytes, got ${key.byteLength}.`);
+      }
+      rootSecret = key ? toArrayBuffer(key) : null;
+      sending = Boolean(key) && options.sending !== false;
+      generation = 0;
+      worker?.postMessage({
+        type: "cipher-key",
+        scheduleId,
+        rootSecret: rootSecret ? rootSecret.slice(0) : null,
+        sending,
+      });
+      announceState();
+    },
+    setSending(value) {
+      if (destroyed) return;
+      sending = value && rootSecret !== null;
+      worker?.postMessage({ type: "cipher-sending", scheduleId, value: sending });
+      announceState();
+    },
+    state: describeState,
+    trackState,
     ratchet() {
       if (destroyed) return;
       generation += 1;

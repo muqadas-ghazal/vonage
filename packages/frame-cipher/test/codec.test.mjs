@@ -18,18 +18,22 @@ const api = new Function(
    return { KeySchedule, sealFrame, openFrame, headerLength, nonceFor, TRAILER_BYTES, REPLAY_WINDOW };`,
 )({ postMessage: (m) => posted.push(m) }, globalThis.crypto, globalThis.performance);
 
-const { KeySchedule, sealFrame, headerLength, nonceFor, TRAILER_BYTES, REPLAY_WINDOW } = api;
+const { KeySchedule, headerLength, nonceFor, TRAILER_BYTES, REPLAY_WINDOW } = api;
+
+/** The worker takes a session (key + sending flag); tests still speak in schedules. */
+const sess = (schedule, sending = true) => ({ schedule, sending, options: {} });
+const sealFrame = (schedule, ...rest) => api.sealFrame(sess(schedule), ...rest);
 
 /** Wraps openFrame with a per-stream replay window, the way one transform does. */
 function receiver(kind = "video") {
   const states = new Map();
   const open = (schedule, ownSenderId, data, probe) =>
-    api.openFrame(schedule, ownSenderId, kind, states, data, probe);
+    api.openFrame(sess(schedule), ownSenderId, kind, states, data, probe);
   open.states = states;
   return open;
 }
 const openFrame = (schedule, ownSenderId, data, probe) =>
-  api.openFrame(schedule, ownSenderId, "video", new Map(), data, probe);
+  api.openFrame(sess(schedule), ownSenderId, "video", new Map(), data, probe);
 
 const SENDER_A = new Uint8Array([1, 2, 3, 4]);
 const SENDER_B = new Uint8Array([9, 9, 9, 9]);
@@ -446,4 +450,133 @@ test("concurrent requests for different generations derive each one exactly once
   // Two senders resolving through those generations must share one counter space.
   const [a, b] = await Promise.all([s.sender(1, SENDER_A, "video"), s.sender(1, SENDER_A, "video")]);
   assert.equal(a, b);
+});
+
+/* ── the on-demand flow: clear call → one side encrypts → the other unlocks ───────── */
+
+const noKey = { schedule: null, sending: false, options: {} };
+
+test("with no key, outgoing frames go out untouched", async () => {
+  const plain = frame();
+  const probe = {};
+  const out = await api.sealFrame(noKey, SENDER_A, false, "video", "delta", plain.buffer.slice(0), probe);
+  assert.deepEqual(new Uint8Array(out), plain, "frame must be unchanged");
+  assert.equal(probe.reason, "plaintext");
+});
+
+test("with a key but sending off, outgoing frames still go out untouched", async () => {
+  const s = schedule(secret());
+  await s.ready;
+  const plain = frame();
+  const out = await api.sealFrame({ schedule: s, sending: false, options: {} },
+    SENDER_A, false, "video", "delta", plain.buffer.slice(0), {});
+  assert.deepEqual(new Uint8Array(out), plain);
+});
+
+test("a receiver with no key passes plaintext straight through", async () => {
+  const plain = frame();
+  const probe = {};
+  const out = await api.openFrame(noKey, SENDER_B, "video", new Map(), plain.buffer.slice(0), probe);
+  assert.deepEqual(new Uint8Array(out), plain);
+  assert.equal(probe.reason, "passthrough");
+});
+
+test("a receiver with no key DROPS sealed frames rather than passing ciphertext on", async () => {
+  const tx = schedule(secret());
+  const sealed = await sealFrame(tx, SENDER_A, false, "video", "delta", frame().buffer.slice(0), null);
+  const probe = {};
+  const out = await api.openFrame(noKey, SENDER_B, "video", new Map(), sealed, probe);
+  assert.equal(out, null, "ciphertext must never reach the decoder");
+  assert.equal(probe.reason, "locked");
+});
+
+test("the whole flow: clear, then sealed-and-locked, then unlocked with the same secret", async () => {
+  const rootSecret = secret();
+  const txSchedule = schedule(rootSecret);
+  const sender = { schedule: txSchedule, sending: false, options: {} };
+  const receiver = { schedule: null, sending: false, options: {} };
+  const states = new Map();
+  const plain = frame();
+
+  // 1. nobody has turned encryption on: video flows in the clear
+  let out = await api.sealFrame(sender, SENDER_A, false, "video", "delta", plain.buffer.slice(0), {});
+  assert.deepEqual(new Uint8Array(await api.openFrame(receiver, SENDER_B, "video", states, out, {})), plain);
+
+  // 2. the sender turns it on; the receiver has no key yet and sees nothing
+  sender.sending = true;
+  const sealed = await api.sealFrame(sender, SENDER_A, false, "video", "delta", plain.buffer.slice(0), {});
+  const lockedProbe = {};
+  assert.equal(await api.openFrame(receiver, SENDER_B, "video", states, sealed.slice(0), lockedProbe), null);
+  assert.equal(lockedProbe.reason, "locked");
+
+  // 3. the receiver enters the same secret and the picture comes back
+  receiver.schedule = schedule(rootSecret);
+  const opened = await api.openFrame(receiver, SENDER_B, "video", states, sealed.slice(0), {});
+  assert.deepEqual(new Uint8Array(opened), plain, "the same frame now decrypts");
+});
+
+test("a receiver that enters the WRONG secret is told so, not shown noise", async () => {
+  const tx = schedule(secret());
+  const sealed = await sealFrame(tx, SENDER_A, false, "video", "delta", frame().buffer.slice(0), null);
+  const receiver = { schedule: schedule(secret()), sending: false, options: {} };
+  const probe = {};
+  assert.equal(await api.openFrame(receiver, SENDER_B, "video", new Map(), sealed, probe), null);
+  assert.equal(probe.reason, "key-mismatch");
+});
+
+test("turning encryption back off returns the stream to plaintext", async () => {
+  const rootSecret = secret();
+  const sender = { schedule: schedule(rootSecret), sending: true, options: {} };
+  const receiver = { schedule: schedule(rootSecret), sending: true, options: {} };
+  const states = new Map();
+  const plain = frame();
+
+  const sealed = await api.sealFrame(sender, SENDER_A, false, "video", "delta", plain.buffer.slice(0), {});
+  assert.notDeepEqual(new Uint8Array(sealed).subarray(3, 50), plain.subarray(3, 50));
+
+  sender.sending = false;
+  const clear = await api.sealFrame(sender, SENDER_A, false, "video", "delta", plain.buffer.slice(0), {});
+  assert.deepEqual(new Uint8Array(clear), plain);
+  // a receiver that still holds a key passes plaintext through unharmed
+  assert.deepEqual(new Uint8Array(await api.openFrame(receiver, SENDER_B, "video", states, clear, {})), plain);
+});
+
+test("changing the key does not leave the replay window rejecting the new frames", async () => {
+  const states = new Map(); // one receive transform, surviving the key change
+  const tx = { schedule: schedule(secret()), sending: true, options: {} };
+  const rx = { schedule: null, sending: false, options: {} };
+  rx.schedule = schedule(secret());
+
+  // Give both sides the same first key and run enough frames to advance the window.
+  const first = secret();
+  tx.schedule = schedule(first);
+  rx.schedule = schedule(first);
+  for (let index = 0; index < 30; index += 1) {
+    const sealed = await api.sealFrame(tx, SENDER_A, false, "video", "delta", frame(120).buffer, null);
+    assert.ok(await api.openFrame(rx, SENDER_B, "video", states, sealed, {}), `frame ${index}`);
+  }
+
+  // Now both change key, exactly as setKey() does. Counters restart at zero.
+  const second = secret();
+  tx.schedule = schedule(second);
+  rx.schedule = schedule(second);
+
+  for (let index = 0; index < 10; index += 1) {
+    const sealed = await api.sealFrame(tx, SENDER_A, false, "video", "delta", frame(120).buffer, null);
+    const probe = {};
+    const out = await api.openFrame(rx, SENDER_B, "video", states, sealed, probe);
+    assert.ok(out, `frame ${index} after the key change was dropped: ${probe.reason}`);
+  }
+});
+
+test("the replay window still works within one key", async () => {
+  const rootSecret = secret();
+  const tx = { schedule: schedule(rootSecret), sending: true, options: {} };
+  const rx = { schedule: schedule(rootSecret), sending: true, options: {} };
+  const states = new Map();
+  const sealed = await api.sealFrame(tx, SENDER_A, false, "video", "delta", frame().buffer, null);
+  assert.ok(await api.openFrame(rx, SENDER_B, "video", states, sealed.slice(0), {}));
+  const probe = {};
+  assert.equal(await api.openFrame(rx, SENDER_B, "video", states, sealed.slice(0), probe), null);
+  assert.equal(probe.reason, "replayed");
 });

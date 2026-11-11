@@ -78,15 +78,20 @@ export class CipherLog {
 
     switch (type) {
       case "cipher-open": {
-        const keyId = String(message.keyId);
+        const keyId = message.keyId == null ? "" : String(message.keyId);
         const algorithm = message.algorithm as CipherAlgorithm;
         const senderId = String(message.senderId ?? "");
+        const trackId = String(message.trackId ?? "");
         const fullFrame = Boolean(message.fullFrame);
+        const canForceKeyFrame = Boolean(message.canForceKeyFrame);
         this.streams.set(id, {
-          id, op, kind, keyId, algorithm, senderId, fullFrame,
+          id, op, kind, keyId, algorithm, senderId, trackId, fullFrame, canForceKeyFrame,
           frames: 0, inBytes: 0, outBytes: 0, keyFrames: 0,
           passthrough: 0, dropped: 0, mismatched: 0, replayed: 0,
           staleGeneration: 0, failed: 0, cryptoMs: 0, generation: 0, reasons: {},
+          locked: 0, plaintext: 0, secured: 0,
+          recentLocked: 0, recentSecured: 0, recentPlaintext: 0,
+          sendingNow: 0, hasSchedule: 0,
           open: true, startedAt: Date.now(),
         });
         const scope = fullFrame ? "whole frame" : "body, codec header left readable";
@@ -118,6 +123,9 @@ export class CipherLog {
           "frames", "inBytes", "outBytes", "keyFrames",
           "passthrough", "dropped", "mismatched", "replayed",
           "staleGeneration", "failed", "cryptoMs", "generation",
+          "locked", "plaintext", "secured",
+          "recentLocked", "recentSecured", "recentPlaintext",
+          "sendingNow", "hasSchedule",
         ] as const) {
           const value = message[field];
           if (typeof value === "number") stream[field] = value;

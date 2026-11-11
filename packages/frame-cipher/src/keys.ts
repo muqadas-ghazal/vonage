@@ -214,3 +214,35 @@ export function ensureMediaKey(options: EnsureKeyOptions = {}): Uint8Array {
   }
   return key;
 }
+
+/* ── Passphrase ──────────────────────────────────────────────────────────────────── */
+
+/**
+ * Turns a human passphrase into a 32-byte call secret with PBKDF2-SHA256.
+ *
+ * A passphrase people type has far less entropy than 32 random bytes, so it is stretched
+ * to make guessing expensive. The salt should be something both sides already agree on
+ * and that differs per room — the room name is the obvious choice — so the same
+ * passphrase in two different rooms does not produce the same key.
+ *
+ * Browser only: it needs WebCrypto. On React Native, derive the secret on a server you
+ * control or use `generateMediaKey()` and move the bytes yourself.
+ */
+export async function deriveKeyFromPassphrase(
+  passphrase: string,
+  salt: string,
+  iterations = 600_000,
+): Promise<Uint8Array> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) throw new Error("frame-cipher: deriveKeyFromPassphrase needs WebCrypto.");
+  const encoder = new TextEncoder();
+  const base = await subtle.importKey("raw", encoder.encode(passphrase.normalize("NFKC")), "PBKDF2", false, [
+    "deriveBits",
+  ]);
+  const bits = await subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: encoder.encode(`frame-cipher/v2/${salt}`), iterations },
+    base,
+    MEDIA_KEY_BYTES * 8,
+  );
+  return new Uint8Array(bits);
+}

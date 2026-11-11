@@ -23,7 +23,11 @@ export type CipherStream = {
   keyId: string;
   algorithm: CipherAlgorithm;
   senderId: string;
+  /** The media track this stream carries, for matching against the video SDK's objects. */
+  trackId: string;
   fullFrame: boolean;
+  /** Whether this transform can force a key frame when the key changes. */
+  canForceKeyFrame: boolean;
   frames: number;
   inBytes: number;
   outBytes: number;
@@ -43,6 +47,19 @@ export type CipherStream = {
   generation: number;
   /** Why frames were dropped, keyed by reason. Useful when a tile stays blank. */
   reasons: Record<string, number>;
+  /** Sealed frames dropped because this endpoint holds no key. */
+  locked: number;
+  /** Frames that travelled in the clear. */
+  plaintext: number;
+  /** Frames successfully sealed or opened. */
+  secured: number;
+  /** The same three, but only for the last reporting window — this is what "currently" means. */
+  recentLocked: number;
+  recentSecured: number;
+  recentPlaintext: number;
+  /** Diagnostics: the worker-side view of this session. */
+  sendingNow: number;
+  hasSchedule: number;
   cryptoMs: number;
   open: boolean;
   startedAt: number;
@@ -97,10 +114,15 @@ export type KeyMismatch = { kind: CipherKind; saw: string; want: string };
 
 export type FrameCipherOptions = {
   /**
-   * 32 raw bytes shared by everyone in the call. Used as HKDF root material, never
-   * directly as an AES key: per-sender, per-generation keys are derived from it.
+   * 32 raw bytes shared by everyone in the call, used as HKDF root material and never
+   * directly as an AES key. Omit it (or pass null) to start the call in the clear and
+   * turn encryption on later with `setKey()`.
    */
-  key: Uint8Array;
+  key?: Uint8Array | null;
+  /** Seal outgoing frames once a key is present. Default true. */
+  sending?: boolean;
+  /** Called whenever the encryption state changes, for driving UI. */
+  onStateChange?: (state: CipherState) => void;
   /**
    * 4 bytes identifying this participant, unique within the call. Two participants
    * sharing an id would share a key and a counter space, so pass a stable value derived
@@ -139,3 +161,17 @@ export type FrameCipherOptions = {
 };
 
 export type FrameCipherSupport = { supported: boolean; reason?: string };
+
+/** A snapshot for the UI: enough to render a lock state without reading frame counters. */
+export type CipherState = {
+  hasKey: boolean;
+  sending: boolean;
+  keyId: string | null;
+  generation: number;
+  /** Remote streams sending sealed frames we cannot open — prompt for the passphrase. */
+  lockedStreams: number;
+  /** Remote streams we are successfully decrypting. */
+  securedStreams: number;
+  /** Remote streams still in the clear. */
+  plaintextStreams: number;
+};

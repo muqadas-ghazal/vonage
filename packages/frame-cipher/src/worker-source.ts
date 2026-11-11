@@ -48,10 +48,57 @@ const MAX_LOOKAHEAD = 16;
 const MAX_COUNTER = 2 ** (COUNTER_BYTES * 8) - 1;
 
 const textEncoder = new TextEncoder();
-const schedules = new Map();
+/**
+ * One session per cipher instance. It starts with no key: the call runs in the clear
+ * until someone turns encryption on, and frames pass through untouched until then.
+ */
+const sessions = new Map();
 const pendingRatchet = new Map();
 
+function sessionFor(id) {
+  let session = sessions.get(id);
+  if (!session) {
+    session = { schedule: null, sending: false, options: null, transforms: new Set() };
+    sessions.set(id, session);
+  }
+  return session;
+}
+
+/**
+ * Force a fresh key frame through every video stream of this session.
+ *
+ * Changing the key breaks the decoder's chain: a receiver that was locked dropped every
+ * frame, key frames included, so the delta frames it can suddenly decrypt refer to
+ * pictures it never saw and it has nothing to draw. Browsers do eventually notice and ask
+ * for a key frame, but on a real camera that can take many seconds, which looks exactly
+ * like a frozen call. So we ask immediately, from both ends: senders emit one, receivers
+ * request one.
+ */
+function askForKeyFrame(entry) {
+  if (entry.kind !== "video") return;
+  const now = performance.now();
+  if (now - entry.lastKeyFrameAsk < 1000) return; // never spam the far end
+  entry.lastKeyFrameAsk = now;
+  try {
+    const transformer = entry.transformer;
+    if (entry.op === "encrypt") {
+      if (typeof transformer.generateKeyFrame === "function") {
+        Promise.resolve(transformer.generateKeyFrame()).catch(() => undefined);
+      }
+    } else if (typeof transformer.sendKeyFrameRequest === "function") {
+      Promise.resolve(transformer.sendKeyFrameRequest()).catch(() => undefined);
+    }
+  } catch {
+    // A transform can refuse while its stream is still settling; the next attempt retries.
+  }
+}
+
+function refreshKeyFrames(session) {
+  for (const entry of session.transforms) askForKeyFrame(entry);
+}
+
 let verbose = false;
+let nextEpoch = 1;
 let sampleFrames = 3;
 let mismatchReported = false;
 
@@ -61,17 +108,40 @@ self.onmessage = (event) => {
   if (data.type === "cipher-sample") sampleFrames = Number(data.value) || 0;
   if (data.type === "cipher-ratchet") {
     const target = Number(data.target) || 0;
-    const schedule = schedules.get(data.scheduleId);
-    if (schedule) {
-      schedule.ratchetTo(target).then((g) => post({ type: "cipher-ratcheted", generation: g }));
+    const session = sessions.get(data.scheduleId);
+    if (session && session.schedule) {
+      session.schedule.ratchetTo(target).then((g) => post({ type: "cipher-ratcheted", generation: g }));
     } else {
       pendingRatchet.set(data.scheduleId, target);
     }
   }
+  if (data.type === "cipher-key") {
+    const session = sessionFor(data.scheduleId);
+    if (session.schedule) session.schedule.wipe();
+    if (data.rootSecret) {
+      session.schedule = new KeySchedule(new Uint8Array(data.rootSecret), session.options || {});
+      session.schedule.ready.then(() =>
+        session.schedule.generation(session.schedule.sendGeneration).then((g) =>
+          post({ type: "cipher-key-set", keyId: g ? g.keyIdHex : null, sending: session.sending }),
+        ),
+      );
+    } else {
+      session.schedule = null;
+      post({ type: "cipher-key-set", keyId: null, sending: false });
+    }
+    if (typeof data.sending === "boolean") session.sending = data.sending;
+    refreshKeyFrames(session);
+  }
+  if (data.type === "cipher-sending") {
+    const session = sessionFor(data.scheduleId);
+    session.sending = Boolean(data.value) && Boolean(session.schedule);
+    post({ type: "cipher-sending-set", sending: session.sending });
+    refreshKeyFrames(session);
+  }
   if (data.type === "cipher-shutdown") {
-    const schedule = schedules.get(data.scheduleId);
-    if (schedule) schedule.wipe();
-    schedules.delete(data.scheduleId);
+    const session = sessions.get(data.scheduleId);
+    if (session && session.schedule) session.schedule.wipe();
+    sessions.delete(data.scheduleId);
   }
 };
 
@@ -105,6 +175,11 @@ async function hkdf(ikm, info, length, salt) {
  */
 class KeySchedule {
   constructor(root, options) {
+    // Each key gets its own epoch. A new key restarts every sender counter at zero, so a
+    // replay window carried over from the previous key would reject the new frames as
+    // stale — which is a dead call, not a dropped packet.
+    this.epoch = nextEpoch;
+    nextEpoch += 1;
     this.root = root;
     this.forwardSecrecy = options.forwardSecrecy !== false;
     this.grace = Number.isFinite(options.generationGrace) ? options.generationGrace : 2;
@@ -325,8 +400,13 @@ function replayRecord(state, counter) {
   }
 }
 
-async function sealFrame(schedule, senderId, fullFrame, kind, frameType, data, probe) {
+async function sealFrame(session, senderId, fullFrame, kind, frameType, data, probe) {
   probe = probe || {};
+  const schedule = session.schedule;
+  if (!schedule || !session.sending) {
+    probe.reason = "plaintext";
+    return new Uint8Array(data).buffer;
+  }
   const generation = schedule.sendGeneration;
   const entry = await schedule.sender(generation, senderId, kind);
   if (!entry) {
@@ -380,12 +460,19 @@ async function sealFrame(schedule, senderId, fullFrame, kind, frameType, data, p
   return out.buffer;
 }
 
-async function openFrame(schedule, ownSenderId, kind, replayStates, data, probe) {
+async function openFrame(session, ownSenderId, kind, replayStates, data, probe) {
   probe = probe || {};
   const source = new Uint8Array(data);
   if (!hasMagic(source)) {
     probe.reason = "passthrough";
     return source.buffer;
+  }
+  const schedule = session.schedule;
+  if (!schedule) {
+    // Sealed, and we hold no key. Dropping is the whole point: handing ciphertext to the
+    // decoder is what paints a scrambled picture instead of an honest locked state.
+    probe.reason = "locked";
+    return null;
   }
 
   const trailerAt = source.byteLength - TRAILER_BYTES;
@@ -427,7 +514,7 @@ async function openFrame(schedule, ownSenderId, kind, replayStates, data, probe)
     }
   }
 
-  const replayKey = generation + ":" + hex(senderId);
+  const replayKey = schedule.epoch + ":" + generation + ":" + hex(senderId);
   let replay = replayStates.get(replayKey);
   if (!replay) {
     replay = { highest: -1, bitmap: 0n };
@@ -481,26 +568,34 @@ self.onrtctransform = (event) => {
   const senderId = new Uint8Array(options.senderId);
   const fullFrame = Boolean(options.fullFrame);
   const id = options.streamId;
+  const trackId = options.trackId || "";
   if (typeof options.sampleFrames === "number") sampleFrames = options.sampleFrames;
   if (typeof options.verbose === "boolean") verbose = options.verbose;
 
-  let schedule = schedules.get(scheduleId);
-  if (!schedule) {
-    schedule = new KeySchedule(new Uint8Array(options.rootSecret), options);
-    schedules.set(scheduleId, schedule);
+  const session = sessionFor(scheduleId);
+  session.options = options;
+  if (!session.schedule && options.rootSecret) {
+    session.schedule = new KeySchedule(new Uint8Array(options.rootSecret), options);
+    session.sending = options.sending !== false;
     const target = Math.max(Number(options.generation) || 0, pendingRatchet.get(scheduleId) || 0);
     pendingRatchet.delete(scheduleId);
-    if (target > 0) schedule.ratchetTo(target);
+    if (target > 0) session.schedule.ratchetTo(target);
   }
 
   const reader = transformer.readable.getReader();
   const writer = transformer.writable.getWriter();
   const replayStates = new Map();
+  const registration = { transformer, op, kind, lastKeyFrameAsk: 0 };
+  let droppedSinceOutput = 0;
+  session.transforms.add(registration);
 
   const stats = {
     frames: 0, inBytes: 0, outBytes: 0, keyFrames: 0,
     passthrough: 0, dropped: 0, mismatched: 0, replayed: 0,
     staleGeneration: 0, failed: 0, cryptoMs: 0, generation: 0,
+    locked: 0, plaintext: 0, secured: 0,
+    recentLocked: 0, recentSecured: 0, recentPlaintext: 0,
+    sendingNow: 0, hasSchedule: 0,
     reasons: {},
   };
   let lastFlush = 0;
@@ -509,18 +604,31 @@ self.onrtctransform = (event) => {
     const now = performance.now();
     if (!force && now - lastFlush < 1000) return;
     lastFlush = now;
-    stats.generation = schedule.sendGeneration;
+    stats.generation = session.schedule ? session.schedule.sendGeneration : 0;
+    stats.sendingNow = session.sending ? 1 : 0;
+    stats.hasSchedule = session.schedule ? 1 : 0;
     post({ type: "cipher-stats", id, op, kind, ...stats });
+    stats.recentLocked = 0;
+    stats.recentSecured = 0;
+    stats.recentPlaintext = 0;
   };
 
   const pump = async () => {
-    await schedule.ready;
-    const generation = await schedule.generation(schedule.sendGeneration);
+    let generation = null;
+    if (session.schedule) {
+      await session.schedule.ready;
+      generation = await session.schedule.generation(session.schedule.sendGeneration);
+    }
     post({
       type: "cipher-open", id, op, kind,
       algorithm: "AES-GCM",
-      keyId: generation ? generation.keyIdHex : "????",
+      canForceKeyFrame:
+        op === "encrypt"
+          ? typeof transformer.generateKeyFrame === "function"
+          : typeof transformer.sendKeyFrameRequest === "function",
+      keyId: generation ? generation.keyIdHex : null,
       senderId: hex(senderId),
+      trackId,
       fullFrame,
     });
     lastFlush = performance.now();
@@ -529,6 +637,7 @@ self.onrtctransform = (event) => {
       const next = await reader.read();
       if (next.done) {
         flush(true);
+        session.transforms.delete(registration);
         post({ type: "cipher-close", id, op, kind });
         await writer.close();
         return;
@@ -541,8 +650,8 @@ self.onrtctransform = (event) => {
 
       try {
         const data = op === "encrypt"
-          ? await sealFrame(schedule, senderId, fullFrame, kind, frame.type, frame.data, probe)
-          : await openFrame(schedule, senderId, kind, replayStates, frame.data, probe);
+          ? await sealFrame(session, senderId, fullFrame, kind, frame.type, frame.data, probe)
+          : await openFrame(session, senderId, kind, replayStates, frame.data, probe);
 
         stats.cryptoMs += performance.now() - startedAt;
         stats.frames += 1;
@@ -551,8 +660,14 @@ self.onrtctransform = (event) => {
 
         if (!data) {
           stats.dropped += 1;
+          droppedSinceOutput += 1;
           const reason = probe.reason || "unknown";
           stats.reasons[reason] = (stats.reasons[reason] || 0) + 1;
+          if (reason === "locked") {
+            stats.locked += 1;
+            stats.recentLocked += 1;
+            if (stats.locked === 1) post({ type: "cipher-locked", id, kind });
+          }
           if (reason === "replayed" || reason === "too-old") stats.replayed += 1;
           if (reason === "stale-generation") stats.staleGeneration += 1;
           if (reason === "key-mismatch") {
@@ -566,8 +681,24 @@ self.onrtctransform = (event) => {
           continue;
         }
 
+        if (droppedSinceOutput > 0) {
+          // We are producing frames again after a gap — from a key arriving, a peer
+          // turning encryption off, or a wrong passphrase being corrected. Whatever the
+          // cause, the decoder's reference chain is broken, so ask for a key frame rather
+          // than waiting for the browser to work it out.
+          droppedSinceOutput = 0;
+          askForKeyFrame(registration);
+        }
         stats.outBytes += data.byteLength;
-        if (probe.reason === "passthrough") stats.passthrough += 1;
+        if (probe.reason === "passthrough" || probe.reason === "plaintext") {
+          stats.passthrough += 1;
+          stats.plaintext += 1;
+          stats.recentPlaintext += 1;
+        } else if (!probe.reason) {
+          stats.secured += 1;
+          stats.recentSecured += 1;
+          if (stats.secured === 1) post({ type: "cipher-secured", id, op, kind });
+        }
 
         if (probe.sample && !probe.reason) {
           post({

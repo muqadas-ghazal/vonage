@@ -4,14 +4,15 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type Fo
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { readName, saveName, serverName, subscribeName } from "@/lib/browser-name";
+import { armMediaCipher, rekeyOnMembershipChange, roomLink } from "@/lib/media-cipher";
 import {
-  armMediaCipher,
-  ensureSharedKey,
-  hasKeyMismatch,
-  rekeyOnMembershipChange,
-  roomLink,
-  subscribeKeyMismatch,
-} from "@/lib/media-cipher";
+  ClearStreamBadge,
+  EncryptionControl,
+  LockedTileOverlay,
+  encryptionSummary,
+  useCipherState,
+} from "./encryption-control";
+import { subscribeCipherState, trackEncryption } from "@/lib/media-cipher";
 import { normalizeName } from "@/lib/room-name";
 import { CipherPanel } from "./cipher-panel";
 
@@ -67,11 +68,8 @@ export function CallRoom({ room }: { room: string }) {
   const publisherNode = useRef<HTMLDivElement>(null);
   const publisher = useRef<Publisher | null>(null);
 
-  const keyMismatch = useSyncExternalStore(subscribeKeyMismatch, hasKeyMismatch, () => false);
-
-  useEffect(() => {
-    ensureSharedKey();
-  }, []);
+  const cipher = useCipherState();
+  const cipherSummary = encryptionSummary(cipher);
 
   useEffect(() => {
     if (!storedName) return;
@@ -93,7 +91,7 @@ export function CallRoom({ room }: { room: string }) {
 
     (async () => {
       try {
-        armMediaCipher();
+        armMediaCipher(room);
         const OT = await loadOT();
         if (cancelled) return;
 
@@ -262,9 +260,9 @@ export function CallRoom({ room }: { room: string }) {
         >
           <p className="font-display text-3xl tracking-tight">Join {room}</p>
           <p className="mt-2 text-sm leading-6 text-[#a3aa94]">
-            This browser will enter the same room. Video and audio are encrypted here
-            before Vonage carries them, and decrypted in the other browser before playback.
-            The key stays in the link after the # and is not sent to the server.
+            This browser will enter the same room. The call starts unencrypted — once you
+            are in, anyone can turn on end-to-end encryption with a passphrase, and
+            everyone who enters the same one is covered.
           </p>
           <label className="mt-5 block text-sm text-[#a3aa94]" htmlFor="join-name">
             Your name
@@ -296,7 +294,17 @@ export function CallRoom({ room }: { room: string }) {
             Booth
           </Link>
           <p className="truncate font-mono text-sm text-[#a3aa94]">{room}</p>
-          <p className="text-xs text-[#d6f25c]">Encrypted in this browser before Vonage</p>
+          <p
+            className={`text-xs ${
+              cipherSummary.tone === "on"
+                ? "text-[#d6f25c]"
+                : cipherSummary.tone === "warn"
+                  ? "text-[#ffb4a8]"
+                  : "text-[#a3aa94]"
+            }`}
+          >
+            {cipherSummary.line}
+          </p>
         </div>
         <div className="flex items-center gap-2">
           <span className="hidden text-sm text-[#a3aa94] sm:inline">
@@ -306,6 +314,7 @@ export function CallRoom({ room }: { room: string }) {
                 ? "Not connected"
                 : "Connecting"}
           </span>
+          <EncryptionControl />
           <button
             type="button"
             onClick={() => setShowCipherLog((value) => !value)}
@@ -325,13 +334,6 @@ export function CallRoom({ room }: { room: string }) {
         {copyNote ? (
           <p className="basis-full text-sm text-[#ffb4a8]">{copyNote}</p>
         ) : null}
-        {keyMismatch ? (
-          <p className="basis-full rounded-2xl border border-[#ffb4a8]/40 bg-[#ffb4a8]/10 px-4 py-3 text-sm leading-6 text-[#ffb4a8]">
-            Someone joined with a different key, so their camera and microphone cannot be
-            unsealed here. Use <strong className="font-medium">Copy room link</strong> and have
-            them open that exact address — the part after the <code>#</code> carries the key.
-          </p>
-        ) : null}
       </header>
 
       <section className="relative mx-4 mb-4 flex min-h-0 flex-1 sm:mx-6">
@@ -349,6 +351,7 @@ export function CallRoom({ room }: { room: string }) {
                   key={stream.streamId}
                   session={session}
                   stream={stream}
+                  expectEncrypted={cipher.hasKey}
                   onAudioBlocked={reportAudioBlocked}
                 />
               ))}
@@ -360,9 +363,7 @@ export function CallRoom({ room }: { room: string }) {
                   ? "The room did not open."
                   : status === "connecting"
                     ? "Connecting you to the room."
-                    : keyMismatch
-                      ? "Their video cannot be unsealed."
-                      : "Waiting for the other browser."}
+                    : "Waiting for the other browser."}
               </p>
               <p className="mt-4 max-w-md text-base leading-7 text-[#c9cdb8]">
                 {status === "error"
@@ -457,13 +458,37 @@ export function CallRoom({ room }: { room: string }) {
 function RemoteTile({
   session,
   stream,
+  expectEncrypted,
   onAudioBlocked,
 }: {
   session: Session;
   stream: Stream;
+  expectEncrypted: boolean;
   onAudioBlocked: () => void;
 }) {
   const node = useRef<HTMLDivElement>(null);
+  const [status, setStatus] = useState<ReturnType<typeof trackEncryption>>("unknown");
+
+  // Driven by the cipher's own updates rather than held in sync by hand: the track behind
+  // a tile is replaced whenever the call renegotiates, so this is re-read each time.
+  useEffect(() => {
+    return subscribeCipherState(() => {
+      const media = node.current?.querySelector("video")?.srcObject;
+      let next: ReturnType<typeof trackEncryption> = "unknown";
+      if (media instanceof MediaStream) {
+        for (const track of media.getTracks()) {
+          const state = trackEncryption(track.id);
+          if (state === "locked") {
+            next = "locked";
+            break;
+          }
+          if (state === "plaintext") next = "plaintext";
+          else if (state === "secured" && next === "unknown") next = "secured";
+        }
+      }
+      setStatus((previous) => (previous === next ? previous : next));
+    });
+  }, []);
 
   useEffect(() => {
     const target = node.current;
@@ -484,6 +509,13 @@ function RemoteTile({
   return (
     <div className="relative h-full min-h-72 overflow-hidden bg-black">
       <div ref={node} className="ot-slot absolute inset-0" />
+      {status === "locked" && !expectEncrypted ? (
+        <LockedTileOverlay
+          name={stream.name || "They"}
+          onUnlock={() => document.querySelector<HTMLButtonElement>("[data-encryption-control]")?.click()}
+        />
+      ) : null}
+      {expectEncrypted && status === "plaintext" ? <ClearStreamBadge /> : null}
       <p className="absolute bottom-4 left-4 rounded-full bg-black/55 px-3 py-1 text-sm">
         {stream.name || "Guest"}
       </p>

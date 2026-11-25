@@ -1,0 +1,59 @@
+{
+  "expo": {
+    "name": "Booth Sealed Call",
+    "slug": "booth-sealed-call",
+    "owner": "sparkleotech23",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/0b1f77b5-3de8-45ca-ba33-53d2d3861b76"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.booth.sealedcall.example"
+    },
+    "android": {
+      "package": "com.booth.sealedcall.example",
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_MICROPHONE",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.WAKE_LOCK"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "@booth/sealed-call-native",
+        {
+          "microphonePermission": "Booth uses your microphone for calls.",
+          "cameraPermission": "Booth uses your camera for calls."
+        }
+      ]
+    ],
+    "extra": {
+      "callUrl": "",
+      "room": "mobile-test",
+      "eas": {
+        "projectId": "0b1f77b5-3de8-45ca-ba33-53d2d3861b76"
+      }
+    }
+  }
+}

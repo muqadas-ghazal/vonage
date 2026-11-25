@@ -1,5 +1,7 @@
 # @booth/frame-cipher
 
+New to this code? Start with [E2E-FLOW.md](./E2E-FLOW.md). It walks one call from zero: which function runs, which browser API it calls, and which algorithm it uses.
+
 End-to-end encryption for WebRTC media, applied to each **encoded frame**.
 
 Your video SDK's servers — Vonage, LiveKit, Twilio, or your own SFU — keep routing the

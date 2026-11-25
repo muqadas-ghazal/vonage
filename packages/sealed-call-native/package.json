@@ -1,0 +1,50 @@
+{
+  "name": "@booth/sealed-call-native",
+  "version": "0.1.0",
+  "description": "End-to-end encrypted Vonage video calls in React Native, by hosting the web call surface in a WebView. Vonage handles the call; this package handles the crypto UI and the background keep-alive.",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./web": {
+      "types": "./dist/web.d.ts",
+      "default": "./dist/web.js"
+    },
+    "./app.plugin.js": "./app.plugin.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "android",
+    "ios",
+    "plugin",
+    "app.plugin.js",
+    "SealedCallNative.podspec",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "peerDependencies": {
+    "expo": ">=50",
+    "react": ">=18",
+    "react-native": ">=0.73",
+    "react-native-webview": ">=13"
+  },
+  "devDependencies": {
+    "@expo/config-plugins": "^58.0.13",
+    "react-native": "^0.81.4",
+    "react-native-webview": "^14.0.1",
+    "typescript": "^5"
+  },
+  "peerDependenciesMeta": {
+    "expo": {
+      "optional": true
+    }
+  }
+}

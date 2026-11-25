@@ -7,8 +7,10 @@
     "build": "npm run build:sdk && next build",
     "start": "next start",
     "lint": "eslint",
-    "build:sdk": "npm run build -w @booth/frame-cipher",
-    "test:sdk": "npm test -w @booth/frame-cipher"
+    "build:sdk": "npm run build -w @booth/frame-cipher && npm run build -w @booth/sealed-call-native && npm run build -w @booth/call-surface",
+    "test:sdk": "npm test -w @booth/frame-cipher",
+    "rooms:clear": "node --env-file=.env scripts/clear-rooms.mjs",
+    "rooms:list": "node --env-file=.env scripts/clear-rooms.mjs --dry-run"
   },
   "dependencies": {
     "@vonage/client-sdk-video": "^2.35.3",
@@ -16,7 +18,8 @@
     "next": "16.4.5",
     "react": "19.3.0",
     "react-dom": "19.3.0",
-    "@booth/frame-cipher": "*"
+    "@booth/frame-cipher": "*",
+    "@booth/sealed-call-native": "*"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "^4",

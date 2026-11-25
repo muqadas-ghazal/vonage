@@ -3,7 +3,7 @@ import fs from "fs";
 import path from "path";
 import { isValidRoom, normalizeName, normalizeRoom } from "./room-name";
 
-type StoredSession = { sessionId: string; mode: "relayed" };
+type StoredSession = { sessionId: string; mode: "relayed"; lastSeen?: number };
 type SessionStore = Record<string, StoredSession | string>;
 
 const dataDir = path.join(process.cwd(), "data");
@@ -260,6 +260,67 @@ async function sessionForRoom(room: string, apiKey: string, apiSecret: string): 
   return sessionId;
 }
 
+/**
+ * The lobby: which rooms are currently open.
+ *
+ * This exists so a second device can discover a room without anyone typing its name —
+ * one person creates, the other sees it appear. Entries go stale rather than being
+ * deleted, because a client that crashes never gets to tell us it left.
+ */
+const LOBBY_KEY = "booth:lobby";
+const LOBBY_TTL_MS = 120_000;
+
+export type OpenRoom = { room: string; lastSeen: number };
+
+/** Marks a room as still alive. Called on join and on a heartbeat from a client. */
+export async function touchRoom(roomInput: string): Promise<void> {
+  const room = normalizeRoom(roomInput);
+  if (!isValidRoom(room)) return;
+  const now = Date.now();
+
+  if (usingSharedStore()) {
+    // A hash field write rather than read-modify-write on one blob, so two devices
+    // touching different rooms at the same moment cannot erase each other.
+    await kv(["HSET", LOBBY_KEY, room, String(now)]);
+    return;
+  }
+
+  const store = readStore();
+  const entry = store[room];
+  if (!entry) return;
+  // An entry stored by an older version is a bare session id string. Normalise it rather
+  // than skipping, or its room could never be announced.
+  const sessionId = storedSessionId(entry);
+  if (!sessionId) return;
+  store[room] = { sessionId, mode: "relayed", lastSeen: now };
+  writeStore(store);
+}
+
+/** Rooms touched recently enough to be worth showing, newest first. */
+export async function listOpenRooms(): Promise<OpenRoom[]> {
+  const cutoff = Date.now() - LOBBY_TTL_MS;
+  const rooms: OpenRoom[] = [];
+
+  if (usingSharedStore()) {
+    const flat = await kv(["HGETALL", LOBBY_KEY]);
+    if (Array.isArray(flat)) {
+      for (let index = 0; index < flat.length - 1; index += 2) {
+        const room = String(flat[index]);
+        const lastSeen = Number(flat[index + 1]);
+        if (Number.isFinite(lastSeen) && lastSeen >= cutoff) rooms.push({ room, lastSeen });
+      }
+    }
+  } else {
+    for (const [room, entry] of Object.entries(readStore())) {
+      if (!entry || typeof entry !== "object") continue;
+      const lastSeen = entry.lastSeen ?? 0;
+      if (lastSeen >= cutoff) rooms.push({ room, lastSeen });
+    }
+  }
+
+  return rooms.sort((left, right) => right.lastSeen - left.lastSeen);
+}
+
 export async function joinRoom(roomInput: string, nameInput: string) {
   const room = normalizeRoom(roomInput);
   const name = normalizeName(nameInput);
@@ -273,6 +334,7 @@ export async function joinRoom(roomInput: string, nameInput: string) {
 
   const { apiKey, apiSecret } = projectCredentials();
   const sessionId = await enqueue(() => sessionForRoom(room, apiKey, apiSecret));
+  await touchRoom(room);
 
   return {
     apiKey,

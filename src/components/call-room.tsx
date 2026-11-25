@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { readName, saveName, serverName, subscribeName } from "@/lib/browser-name";
 import { armMediaCipher, rekeyOnMembershipChange, roomLink } from "@/lib/media-cipher";
+import { installNativeBridge } from "@/lib/native-bridge";
 import {
   ClearStreamBadge,
   EncryptionControl,
@@ -70,6 +71,10 @@ export function CallRoom({ room }: { room: string }) {
 
   const cipher = useCipherState();
   const cipherSummary = encryptionSummary(cipher);
+
+  // Hands cipher state to the React Native shell and takes keys back, when this page is
+  // running inside one. A no-op in a normal browser.
+  useEffect(() => installNativeBridge(), []);
 
   useEffect(() => {
     if (!storedName) return;

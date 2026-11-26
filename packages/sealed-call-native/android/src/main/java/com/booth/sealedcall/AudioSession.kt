@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
@@ -38,6 +39,9 @@ object AudioSession {
 
     if (previousMode == null) previousMode = manager.mode
     manager.mode = AudioManager.MODE_IN_COMMUNICATION
+    // Voice-call mode plays through the earpiece. A phone held out to watch the screen
+    // then sounds silent. The loudspeaker is the output for this call.
+    routeToSpeaker(manager)
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       val attributes = AudioAttributes.Builder()
@@ -78,6 +82,22 @@ object AudioSession {
     // the mode in IN_COMMUNICATION affects every other app's audio routing.
     manager.mode = previousMode ?: AudioManager.MODE_NORMAL
     previousMode = null
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      manager.clearCommunicationDevice()
+    }
+    @Suppress("DEPRECATION")
+    manager.isSpeakerphoneOn = false
+  }
+
+  private fun routeToSpeaker(manager: AudioManager) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      val speaker = manager.availableCommunicationDevices.firstOrNull {
+        it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+      }
+      if (speaker != null && manager.setCommunicationDevice(speaker)) return
+    }
+    @Suppress("DEPRECATION")
+    manager.isSpeakerphoneOn = true
   }
 
   /**

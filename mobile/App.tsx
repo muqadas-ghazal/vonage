@@ -1,11 +1,9 @@
 import {
   SealedCall,
-  keepAliveAvailable,
   nativePermissionState,
   useSealedCall,
   type NativePermissionState,
 } from "@booth/sealed-call-native";
-import Constants from "expo-constants";
 import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useState } from "react";
 import {
@@ -15,6 +13,7 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
   TextInput,
@@ -22,15 +21,20 @@ import {
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 
-import { fetchOpenRooms, heartbeat, newRoomName, normalizeBase, type OpenRoom } from "./src/lobby";
+import {
+  heartbeat,
+  isValidRoom,
+  normalizeBase,
+  normalizeName,
+  roomFromInput,
+  roomLink,
+  suggestRoom,
+} from "./src/lobby";
 import { useMediaPermissions } from "./src/permissions";
 
-const extra = (Constants.expoConfig?.extra ?? {}) as { callUrl?: string; room?: string };
+const DEFAULT_BACKEND = "https://puppy-upstream-drop-down.ngrok-free.dev";
 
-type Screen =
-  | { kind: "lobby" }
-  | { kind: "join"; room: string }
-  | { kind: "call"; room: string };
+type Screen = { kind: "lobby" } | { kind: "call"; room: string };
 
 export default function App() {
   return (
@@ -41,140 +45,56 @@ export default function App() {
 }
 
 function Root() {
-  const [apiBase, setApiBase] = useState(extra.callUrl ?? "");
   const [name, setName] = useState("");
+  const [roomDraft, setRoomDraft] = useState(suggestRoom);
   const [screen, setScreen] = useState<Screen>({ kind: "lobby" });
 
-  // The room this device created. We must not offer to "join" our own room, or the
-  // creator would be bounced to a join screen by their own announcement. State rather
-  // than a ref because the lobby reads it while rendering.
-  const [ownRoom, setOwnRoom] = useState<string | null>(null);
-
-  const create = useCallback(() => {
-    const room = newRoomName();
-    setOwnRoom(room);
-    setScreen({ kind: "call", room });
-  }, []);
+  const openRoom = useCallback(() => {
+    const nextName = normalizeName(name);
+    const nextRoom = roomFromInput(roomDraft);
+    if (nextName.length < 1) {
+      Alert.alert("Name", "Enter the name the other person should see.");
+      return;
+    }
+    if (!isValidRoom(nextRoom)) {
+      Alert.alert("Room", "Use a room name with at least 3 letters or numbers.");
+      return;
+    }
+    setName(nextName);
+    setRoomDraft(nextRoom);
+    setScreen({ kind: "call", room: nextRoom });
+  }, [name, roomDraft]);
 
   if (screen.kind === "lobby") {
     return (
       <Lobby
-        apiBase={apiBase}
         name={name}
-        onApiBase={setApiBase}
+        room={roomDraft}
         onName={setName}
-        onCreate={create}
-        ownRoom={ownRoom}
-        onRoomAppeared={(room) => setScreen({ kind: "join", room })}
-      />
-    );
-  }
-
-  if (screen.kind === "join") {
-    return (
-      <Join
-        room={screen.room}
-        onJoin={() => setScreen({ kind: "call", room: screen.room })}
-        onBack={() => setScreen({ kind: "lobby" })}
+        onRoom={setRoomDraft}
+        onOpen={openRoom}
       />
     );
   }
 
   return (
     <Call
-      apiBase={normalizeBase(apiBase)}
+      apiBase={normalizeBase(DEFAULT_BACKEND)}
       room={screen.room}
-      name={name.trim() || "Tester"}
-      onLeave={() => {
-        setOwnRoom(null);
-        setScreen({ kind: "lobby" });
-      }}
+      name={name}
+      onLeave={() => setScreen({ kind: "lobby" })}
     />
   );
 }
 
-/**
- * Whether a URL can get the camera.
- *
- * https always can. Plain http only on loopback, which browsers treat as a secure
- * context — useful on the iOS simulator. An Android emulator reaches the host as
- * 10.0.2.2, which is not loopback, so Android needs https.
- */
-function isSecureContextUrl(value: string): boolean {
-  try {
-    const parsed = new URL(value);
-    if (parsed.protocol === "https:") return true;
-    if (parsed.protocol !== "http:") return false;
-    return parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
-  } catch {
-    return false;
-  }
-}
-
 function Lobby(props: {
-  apiBase: string;
   name: string;
-  ownRoom: string | null;
-  onApiBase(value: string): void;
+  room: string;
   onName(value: string): void;
-  onCreate(): void;
-  onRoomAppeared(room: string): void;
+  onRoom(value: string): void;
+  onOpen(): void;
 }) {
-  // Surfaced on the first screen, not only inside a call: a permission the app believes it
-  // has but the OS never granted is the single most misleading failure here.
-  const [permissionNote, setPermissionNote] = useState("Checking permissions…");
-  useEffect(() => {
-    let cancelled = false;
-    void nativePermissionState().then((state) => {
-      if (cancelled) return;
-      setPermissionNote(
-        state
-          ? `OS permissions: mic=${state.recordAudio} cam=${state.camera} audioMode=${state.audioMode} micMuted=${state.micMuted}`
-          : "OS permission check unavailable — native module not linked (expected in Expo Go).",
-      );
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const [rooms, setRooms] = useState<OpenRoom[]>([]);
-  const [problem, setProblem] = useState("");
-  const ready = isSecureContextUrl(normalizeBase(props.apiBase));
-
-  const { ownRoom, onRoomAppeared } = props;
-  const base = normalizeBase(props.apiBase);
-
-  useEffect(() => {
-    if (!ready) return;
-    let cancelled = false;
-    const controller = new AbortController();
-
-    const tick = async () => {
-      try {
-        const open = await fetchOpenRooms(base, controller.signal);
-        if (cancelled) return;
-        setProblem("");
-        setRooms(open);
-        // The whole point: someone else opened a room, so move straight to the join
-        // screen rather than making the user read a list and tap.
-        const other = open.find((entry) => entry.room !== ownRoom);
-        if (other) onRoomAppeared(other.room);
-      } catch (error) {
-        if (cancelled || controller.signal.aborted) return;
-        setProblem(error instanceof Error ? error.message : String(error));
-      }
-    };
-
-    void tick();
-    const timer = setInterval(tick, 2000);
-    return () => {
-      cancelled = true;
-      controller.abort();
-      clearInterval(timer);
-    };
-  }, [base, ready, ownRoom, onRoomAppeared]);
-
+  const link = roomLink(DEFAULT_BACKEND, roomFromInput(props.room) || "room");
   return (
     <SafeAreaView style={styles.screen}>
       <StatusBar style="light" />
@@ -182,99 +102,43 @@ function Lobby(props: {
         behavior={Platform.OS === "ios" ? "padding" : undefined}
         style={styles.setup}
       >
-        <Text style={styles.title}>Set up a room</Text>
+        <Text style={styles.title}>Open a room</Text>
         <Text style={styles.subtitle}>
-          Create one here, or wait — if someone else opens a room you will be taken to it.
+          Use the same room name on both sides, or share the room link. The other person opens
+          that link, enters their name, and joins this call.
         </Text>
-
-        <Text style={styles.label}>Backend</Text>
-        <TextInput
-          style={styles.input}
-          value={props.apiBase}
-          onChangeText={props.onApiBase}
-          placeholder="http://localhost:3000"
-          placeholderTextColor="#667"
-          autoCapitalize="none"
-          autoCorrect={false}
-          keyboardType="url"
-        />
 
         <Text style={styles.label}>Your name</Text>
         <TextInput
           style={styles.input}
           value={props.name}
           onChangeText={props.onName}
-          placeholder="Tester"
+          placeholder="Ada"
           placeholderTextColor="#667"
           autoCapitalize="words"
+          maxLength={32}
         />
 
-        <Pressable
-          style={[styles.primary, !ready && styles.disabled]}
-          onPress={() => {
-            if (!ready) {
-              Alert.alert(
-                "Not a secure origin",
-                "The backend needs https, or plain http on localhost.",
-              );
-              return;
-            }
-            props.onCreate();
-          }}
-        >
-          <Text style={styles.primaryText}>Create a room</Text>
+        <Text style={styles.label}>Room name</Text>
+        <TextInput
+          style={styles.input}
+          value={props.room}
+          onChangeText={props.onRoom}
+          placeholder="amber-harbor"
+          placeholderTextColor="#667"
+          autoCapitalize="none"
+          autoCorrect={false}
+          maxLength={120}
+        />
+
+        <Text style={styles.note} selectable>
+          {link}
+        </Text>
+
+        <Pressable style={styles.primary} onPress={props.onOpen}>
+          <Text style={styles.primaryText}>Open room</Text>
         </Pressable>
-
-        <View style={styles.waiting}>
-          {ready ? (
-            <>
-              <ActivityIndicator color="#3ba776" />
-              <Text style={styles.note}>
-                {rooms.length === 0
-                  ? "Watching for a room…"
-                  : `${rooms.length} room${rooms.length === 1 ? "" : "s"} open`}
-              </Text>
-            </>
-          ) : (
-            <Text style={styles.note}>Enter the backend URL to start watching.</Text>
-          )}
-        </View>
-
-        {problem ? <Text style={styles.problem}>{problem}</Text> : null}
-
-        <Text style={styles.note}>
-          {permissionNote}
-        </Text>
-
-        <Text style={styles.note}>
-          {keepAliveAvailable()
-            ? "Background keep-alive: linked."
-            : "Background keep-alive: not linked — expected in Expo Go. The call drops if you background it."}
-        </Text>
       </KeyboardAvoidingView>
-    </SafeAreaView>
-  );
-}
-
-function Join(props: { room: string; onJoin(): void; onBack(): void }) {
-  return (
-    <SafeAreaView style={styles.screen}>
-      <StatusBar style="light" />
-      <View style={styles.setup}>
-        <Text style={styles.title}>A room is open</Text>
-        <Text style={styles.subtitle}>Someone started a call. Join to connect.</Text>
-
-        <View style={styles.roomCard}>
-          <Text style={styles.roomName}>{props.room}</Text>
-        </View>
-
-        <Pressable style={styles.primary} onPress={props.onJoin}>
-          <Text style={styles.primaryText}>Join</Text>
-        </Pressable>
-        <Pressable style={styles.secondary} onPress={props.onBack}>
-          <Text style={styles.secondaryText}>Back</Text>
-        </Pressable>
-      </View>
     </SafeAreaView>
   );
 }
@@ -336,7 +200,11 @@ function Live(props: { apiBase: string; room: string; name: string; onLeave(): v
   useEffect(() => {
     let cancelled = false;
     void nativePermissionState().then((state) => {
-      if (!cancelled) setOsPermissions(state);
+      if (cancelled) return;
+      setOsPermissions(state);
+      console.log(
+        `[sealed-call] os mic=${state?.recordAudio ?? "unknown"} cam=${state?.camera ?? "unknown"} mode=${state?.audioMode ?? "unknown"} muted=${state?.micMuted ?? "unknown"}`,
+      );
     });
     return () => {
       cancelled = true;
@@ -390,7 +258,7 @@ function Live(props: { apiBase: string; room: string; name: string; onLeave(): v
     <View style={styles.screen}>
       <StatusBar style="light" />
       <SealedCall
-        url={`${apiBase}/surface/index.html`}
+        url={`${apiBase}/surface/index.html?v=6`}
         config={{ apiBase, room, name: props.name }}
         call={call}
         
@@ -407,10 +275,22 @@ function Live(props: { apiBase: string; room: string; name: string; onLeave(): v
           <View style={styles.row}>
             <Badge status={status} />
             <Text style={styles.roomTag}>{room}</Text>
+            <Pressable
+              style={[styles.leave, styles.share]}
+              onPress={() => {
+                const link = roomLink(props.apiBase, room);
+                void Share.share({ message: link });
+              }}
+            >
+              <Text style={styles.leaveText}>Share</Text>
+            </Pressable>
             <Pressable style={styles.leave} onPress={props.onLeave}>
               <Text style={styles.leaveText}>Leave</Text>
             </Pressable>
           </View>
+          <Text style={styles.stat} selectable>
+            {roomLink(props.apiBase, room)}
+          </Text>
 
           {/* What the WebView and the page are doing. Shown natively, because a page
               that is not painting cannot tell you anything itself. */}
@@ -573,8 +453,8 @@ const styles = StyleSheet.create({
   row: { flexDirection: "row", alignItems: "center", gap: 10 },
   badge: { borderRadius: 999, paddingHorizontal: 12, paddingVertical: 6 },
   badgeText: { color: "#04130b", fontWeight: "700", fontSize: 12 },
+  share: { marginLeft: "auto" },
   leave: {
-    marginLeft: "auto",
     borderRadius: 999,
     paddingHorizontal: 14,
     paddingVertical: 6,

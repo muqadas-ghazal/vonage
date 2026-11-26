@@ -133,7 +133,75 @@ type MediaProbe = {
    * constraints failed but relaxed ones worked. Handed straight to the publisher.
    */
   audioTrack: MediaStreamTrack | null;
+  /** A live camera track opened by the probe. Handed to the publisher so it does not ask again. */
+  videoTrack: MediaStreamTrack | null;
 };
+
+/** How long a single capture may sit unanswered before we treat it as failed. */
+const CAPTURE_TIMEOUT_MS = 8_000;
+
+const rawAudio: MediaTrackConstraints = {
+  echoCancellation: false,
+  noiseSuppression: false,
+  autoGainControl: false,
+};
+
+function isAndroid(): boolean {
+  return /Android/i.test(navigator.userAgent);
+}
+
+/**
+ * `getUserMedia` on Android sometimes never settles. A timeout turns that into a result
+ * the caller can fall past, instead of leaving the status line stuck.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const error = new Error("timed out");
+      error.name = "Timeout";
+      reject(error);
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function failureName(error: unknown): string {
+  if (error instanceof Error) {
+    const name = error.name === "Error" ? "Error" : error.name;
+    return error.message && error.message !== name ? `${name}: ${error.message}` : name;
+  }
+  return String(error);
+}
+
+async function capture(
+  constraints: MediaStreamConstraints,
+): Promise<{ name: string; stream: MediaStream | null }> {
+  try {
+    const stream = await withTimeout(navigator.mediaDevices.getUserMedia(constraints), CAPTURE_TIMEOUT_MS);
+    return { name: "ok", stream };
+  } catch (error) {
+    return { name: failureName(error), stream: null };
+  }
+}
+
+/** Keeps the first track of one kind and releases everything else in the stream. */
+function keepTrack(stream: MediaStream, kind: "audio" | "video"): MediaStreamTrack | null {
+  const tracks = kind === "audio" ? stream.getAudioTracks() : stream.getVideoTracks();
+  const kept = tracks[0] ?? null;
+  for (const track of stream.getTracks()) {
+    if (track !== kept) track.stop();
+  }
+  return kept;
+}
 
 /**
  * Asks the WebView directly what media it can see and open.
@@ -143,14 +211,16 @@ type MediaProbe = {
  * Testing each kind separately is the only way to tell them apart — and it decides which
  * track to fall back to, which the combined error cannot.
  *
- * Each track is stopped immediately, and the caller waits before publishing, so the probe
- * cannot be what holds the hardware.
+ * On desktop the tracks are stopped so Vonage can open the devices itself. On Android the
+ * tracks are kept: the default microphone constraints use voice-communication capture,
+ * and that request can stay pending forever inside the WebView. Opening the camera on its
+ * own, and the microphone with processing disabled, is what actually returns.
  */
 async function probeMedia(): Promise<MediaProbe> {
   const parts: string[] = [];
 
   try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
+    const devices = await withTimeout(navigator.mediaDevices.enumerateDevices(), CAPTURE_TIMEOUT_MS);
     const cameras = devices.filter((device) => device.kind === "videoinput");
     const microphones = devices.filter((device) => device.kind === "audioinput");
     // Empty labels mean the page has not been granted access, which is a different
@@ -158,50 +228,138 @@ async function probeMedia(): Promise<MediaProbe> {
     const labelled = cameras.some((device) => device.label.length > 0);
     parts.push(`cams=${cameras.length} mics=${microphones.length} labels=${labelled ? "yes" : "no"}`);
   } catch (error) {
-    parts.push(`enumerate=${describe(error)}`);
+    parts.push(`enumerate=${failureName(error)}`);
   }
 
-  const attempt = async (constraints: MediaStreamConstraints): Promise<string> => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      for (const track of stream.getTracks()) track.stop();
-      return "ok";
-    } catch (error) {
-      return error instanceof Error ? error.name : String(error);
-    }
-  };
-
-  let audio = await attempt({ audio: true });
-  const video = await attempt({ video: true });
-
-  // Hardware contention is often momentary — a previous holder releasing late. One retry
-  // separates "busy right now" from "cannot be opened at all".
-  if (audio !== "ok") {
-    await new Promise((resolve) => setTimeout(resolve, 800));
-    const second = await attempt({ audio: true });
-    audio = second === "ok" ? "ok (after retry)" : `${audio}/${second}`;
-  }
-
-  // Default audio constraints ask for the hardware echo canceller, which on Android goes
-  // through VOICE_COMMUNICATION capture. When that path is unavailable the request fails
-  // with NotReadableError even though the microphone itself is free — raw audio opens.
-  // The track is kept alive rather than stopped, because the publisher will use it.
+  let audio = "skipped";
+  let video = "skipped";
   let audioTrack: MediaStreamTrack | null = null;
-  if (!audio.startsWith("ok")) {
+  let videoTrack: MediaStreamTrack | null = null;
+
+  if (isAndroid()) {
+    // Audio only, before the camera. A combined request was failing the microphone with
+    // "Could not start audio source" on every constraint, while video alone succeeded.
+    status("Opening the microphone…");
     try {
-      const raw = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-      });
-      audioTrack = raw.getAudioTracks()[0] ?? null;
-      for (const track of raw.getVideoTracks()) track.stop();
-      parts.push(audioTrack ? "raw-audio=ok" : "raw-audio=no-track");
+      const context = new AudioContext();
+      await context.resume();
+      await context.close();
+      parts.push("audio-context=resumed");
     } catch (error) {
-      parts.push(`raw-audio=${error instanceof Error ? error.name : String(error)}`);
+      parts.push(`audio-context=${failureName(error)}`);
+    }
+
+    const narrow = (sampleRate: number): MediaTrackConstraints => ({
+      ...rawAudio,
+      channelCount: 1,
+      sampleRate,
+    });
+    const attempts: { label: string; constraints: MediaStreamConstraints }[] = [
+      { label: "voice-16k", constraints: { audio: { channelCount: 1, sampleRate: 16000 } } },
+      { label: "raw-16k", constraints: { audio: narrow(16000) } },
+      { label: "raw-44k", constraints: { audio: narrow(44100) } },
+      { label: "voice", constraints: { audio: true } },
+      { label: "raw", constraints: { audio: rawAudio } },
+    ];
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      for (const device of devices.filter((entry) => entry.kind === "audioinput" && entry.deviceId)) {
+        attempts.push({
+          label: `mic-${device.deviceId.slice(0, 4)}`,
+          constraints: { audio: { deviceId: { exact: device.deviceId } } },
+        });
+      }
+    } catch (error) {
+      parts.push(`mic-ids=${failureName(error)}`);
+    }
+
+    let last = "skipped";
+    for (const attempt of attempts) {
+      const result = await capture(attempt.constraints);
+      last = result.name;
+      parts.push(`${attempt.label}=${result.stream ? "ok" : result.name}`);
+      status(`Microphone ${attempt.label}: ${result.stream ? "opened" : result.name}`);
+      if (!result.stream) continue;
+      audioTrack = keepTrack(result.stream, "audio");
+      if (audioTrack) {
+        audio = "ok";
+        break;
+      }
+    }
+
+    // Automatic capture is not a user gesture. Some Android WebViews refuse to start
+    // the audio recorder until the tap happens inside the page itself.
+    if (!audioTrack) {
+      status("Tap the video area to start the microphone");
+      await new Promise<void>((resolve) => {
+        const start = () => {
+          document.removeEventListener("pointerdown", start);
+          resolve();
+        };
+        document.addEventListener("pointerdown", start, { once: true });
+      });
+      const result = await capture({ audio: true });
+      last = result.name;
+      parts.push(`gesture=${result.stream ? "ok" : result.name}`);
+      status(`Microphone gesture: ${result.stream ? "opened" : result.name}`);
+      if (result.stream) audioTrack = keepTrack(result.stream, "audio");
+    }
+
+    if (!audioTrack) audio = last;
+    status("Opening the camera…");
+    const videoAttempt = await capture({ video: true });
+    if (videoAttempt.stream) {
+      videoTrack = keepTrack(videoAttempt.stream, "video");
+      video = videoTrack ? "ok" : "no-video-track";
+    } else {
+      video = videoAttempt.name;
+    }
+    parts.push("android-audio-first=1");
+  } else {
+    const attempt = async (constraints: MediaStreamConstraints): Promise<string> => {
+      const result = await capture(constraints);
+      if (result.stream) {
+        for (const track of result.stream.getTracks()) track.stop();
+      }
+      return result.name;
+    };
+
+    audio = await attempt({ audio: true });
+    video = await attempt({ video: true });
+
+    // Hardware contention is often momentary — a previous holder releasing late. One retry
+    // separates "busy right now" from "cannot be opened at all".
+    if (audio !== "ok") {
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      const second = await attempt({ audio: true });
+      audio = second === "ok" ? "ok (after retry)" : `${audio}/${second}`;
+    }
+
+    // Default audio constraints ask for the hardware echo canceller. When that path is
+    // unavailable the request fails even though the microphone itself is free.
+    // The track is kept alive rather than stopped, because the publisher will use it.
+    if (!audio.startsWith("ok")) {
+      const raw = await capture({ audio: rawAudio });
+      audioTrack = raw.stream ? keepTrack(raw.stream, "audio") : null;
+      parts.push(audioTrack ? "raw-audio=ok" : `raw-audio=${raw.name}`);
     }
   }
 
   parts.push(`audio=${audio}`, `video=${video}`);
-  return { audio, video, report: parts.join(" · "), audioTrack };
+  return { audio, video, report: parts.join(" · "), audioTrack, videoTrack };
+}
+
+const playing = new WeakSet<MediaStream>();
+let playback: AudioContext | null = null;
+
+/** Plays a remote stream through Web Audio. The tile's media element stays muted on Android. */
+function playRemote(stream: MediaStream) {
+  if (playing.has(stream) || stream.getAudioTracks().length === 0) return;
+  playing.add(stream);
+  if (!playback) playback = new AudioContext();
+  void playback.resume().catch(() => undefined);
+  const source = playback.createMediaStreamSource(stream);
+  source.connect(playback.destination);
 }
 
 async function main() {
@@ -247,16 +405,31 @@ async function main() {
   session.on("streamCreated", (event: { stream: Stream }) => {
     const id = event.stream.streamId;
     const tile = addTile(id);
-    session.subscribe(
+    const subscriber = session.subscribe(
       event.stream,
       tile,
-      { insertMode: "append", width: "100%", height: "100%" },
+      { insertMode: "append", width: "100%", height: "100%", subscribeToAudio: true, audioVolume: 100 },
       (error) => {
         if (error) removeTile(id);
         // The track only exists once the subscriber is wired up, so paint after it lands.
         else setTimeout(paint, 0);
       },
     );
+    // Android WebView leaves the remote tile silent. Play that stream through Web Audio
+    // instead, and keep the element muted so the same voice is not heard twice.
+    const audible = (element: HTMLMediaElement) => {
+      const source = element.srcObject;
+      if (isAndroid()) {
+        element.muted = true;
+        if (source instanceof MediaStream) playRemote(source);
+        return;
+      }
+      element.muted = false;
+      element.volume = 1;
+      void element.play().catch(() => undefined);
+    };
+    subscriber.on("videoElementCreated", (created: { element: HTMLVideoElement }) => audible(created.element));
+    subscriber.on("audioElementCreated", (created: { element: HTMLAudioElement }) => audible(created.element));
   });
 
   session.on("streamDestroyed", (event: { stream: Stream }) => removeTile(event.stream.streamId));
@@ -272,8 +445,11 @@ async function main() {
   status("Checking the camera and microphone…");
   const probe = await probeMedia();
   postPageMedia(probe.report);
-  // Give the hardware a moment to be released before Vonage asks for it.
-  await new Promise((resolve) => setTimeout(resolve, 400));
+  // Give the hardware a moment to be released before Vonage asks for it. Skipped when the
+  // probe is handing over live tracks — stopping them here would drop the camera we just opened.
+  if (!probe.audioTrack && !probe.videoTrack) {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
 
   const audioWorks = probe.audio.startsWith("ok") || probe.audioTrack !== null;
   const videoWorks = probe.video.startsWith("ok");
@@ -311,7 +487,11 @@ async function main() {
               ? { audioSource: probe.audioTrack }
               : {}
             : { audioSource: null }),
-          ...(withVideo ? {} : { videoSource: null }),
+          ...(withVideo
+            ? probe.videoTrack
+              ? { videoSource: probe.videoTrack }
+              : {}
+            : { videoSource: null }),
         },
         (error) => {
           if (!error) {

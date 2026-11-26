@@ -131,6 +131,7 @@ export function SealedCall({
 
   const inCall = call.page.status === PAGE_STATUS_IN_CALL;
   const keepAliveStarted = useRef(false);
+  const audioPrepared = useRef(false);
 
   useEffect(() => {
     if (keepAlive === false || !inCall || keepAliveStarted.current) return;
@@ -142,15 +143,26 @@ export function SealedCall({
   }, [inCall]);
 
   useEffect(() => {
-    // Before the WebView captures anything: on Android this takes audio focus and sets
-    // the voice-call audio mode, which is what makes the microphone obtainable at all
-    // when something else holds it.
-    void prepareAudio();
+    // Voice-call mode is applied only after the page is publishing. Setting
+    // MODE_IN_COMMUNICATION first makes the WebView's getUserMedia fail with
+    // NotReadableError: permission is granted, and the mic still will not open.
+    console.log("[sealed-call] voice-call mode deferred until the microphone is open");
     return () => {
       void stopKeepAlive();
       void releaseAudio();
     };
   }, []);
+
+  useEffect(() => {
+    if (!inCall || audioPrepared.current) return;
+    audioPrepared.current = true;
+    console.log("[sealed-call] call is publishing; setting voice-call mode now");
+    void prepareAudio().then((ok) => {
+      console.log(
+        `[sealed-call] prepareAudio ${ok ? "applied" : "skipped or failed (no native module, or Android rejected it)"}`,
+      );
+    });
+  }, [inCall]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (next) => {
@@ -165,6 +177,14 @@ export function SealedCall({
     (event) => {
       const message = parsePageMessage(event.nativeEvent.data);
       if (!message) return;
+      if (message.t === "status") console.log(`[sealed-call] status: ${message.text}`);
+      if (message.t === "media") console.log(`[sealed-call] media: ${message.report}`);
+      if (message.t === "error") console.log(`[sealed-call] error: ${message.message}`);
+      if (message.t === "ready") {
+        console.log(
+          `[sealed-call] page ready supported=${message.supported}${message.reason ? ` reason=${message.reason}` : ""}`,
+        );
+      }
       if (message.t === "error" && !message.nonce) onError?.(message.message);
       internal.ingest(message);
     },

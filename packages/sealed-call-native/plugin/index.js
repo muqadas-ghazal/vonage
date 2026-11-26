@@ -31,7 +31,9 @@ function configPlugins() {
   );
 }
 
-const { AndroidConfig, withAndroidManifest, withInfoPlist } = configPlugins();
+const { AndroidConfig, withAndroidManifest, withDangerousMod, withInfoPlist } = configPlugins();
+const fs = require("fs");
+const path = require("path");
 
 /**
  * Expo config plugin for @booth/sealed-call-native.
@@ -68,6 +70,66 @@ function withSealedCallIos(config, props) {
   });
 }
 
+const SYNC_GRANT = `        // If all the permissions are already granted, send the response to the WebView synchronously
+        if (requestedAndroidPermissions.isEmpty()) {
+            request.grant(grantedPermissions.toArray(new String[0]));
+            grantedPermissions = null;
+            return;
+        }`;
+
+const DEFERRED_GRANT = `        // Grant on the next turn of the WebView thread. Chromium fails to start the
+        // microphone (NotReadableError: Could not start audio source) when grant()
+        // runs inside onPermissionRequest itself.
+        if (requestedAndroidPermissions.isEmpty()) {
+            final String[] resources = grantedPermissions.toArray(new String[0]);
+            grantedPermissions = null;
+            mWebView.post(() -> request.grant(resources));
+            return;
+        }`;
+
+function patchWebViewAudioGrant(projectRoot) {
+  const relative = path.join(
+    "node_modules",
+    "react-native-webview",
+    "android",
+    "src",
+    "main",
+    "java",
+    "com",
+    "reactnativecommunity",
+    "webview",
+    "RNCWebChromeClient.java",
+  );
+  const candidates = [
+    path.join(projectRoot, relative),
+    path.join(projectRoot, "..", relative),
+  ];
+  const target = candidates.find((file) => fs.existsSync(file));
+  if (!target) {
+    throw new Error(
+      "@booth/sealed-call-native: could not find RNCWebChromeClient.java to defer the microphone grant.",
+    );
+  }
+  const source = fs.readFileSync(target, "utf8");
+  if (source.includes("mWebView.post(() -> request.grant(resources))")) return;
+  if (!source.includes(SYNC_GRANT)) {
+    throw new Error(
+      "@booth/sealed-call-native: RNCWebChromeClient.java no longer contains the synchronous grant. Check the react-native-webview version.",
+    );
+  }
+  fs.writeFileSync(target, source.replace(SYNC_GRANT, DEFERRED_GRANT));
+}
+
+function withWebViewAudioGrant(config) {
+  return withDangerousMod(config, [
+    "android",
+    (mod) => {
+      patchWebViewAudioGrant(mod.modRequest.projectRoot);
+      return mod;
+    },
+  ]);
+}
+
 function withSealedCallAndroid(config) {
   const withPermissions = AndroidConfig.Permissions.withPermissions(config, [
     "android.permission.CAMERA",
@@ -91,5 +153,5 @@ function withSealedCallAndroid(config) {
 }
 
 module.exports = function withSealedCall(config, props = {}) {
-  return withSealedCallAndroid(withSealedCallIos(config, props));
+  return withWebViewAudioGrant(withSealedCallAndroid(withSealedCallIos(config, props)));
 };

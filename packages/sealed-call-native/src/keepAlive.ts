@@ -75,12 +75,11 @@ export const keepAlivePlatformNote =
     : "iOS: needs `audio` in UIBackgroundModes.";
 
 /**
- * Claims the microphone for a voice call before the WebView tries to capture.
+ * Claims the microphone for a voice call after the WebView has already opened it.
  *
- * Android arbitrates capture by audio focus and declared use case, so an app that just
- * calls getUserMedia can be refused with NotReadableError while another process holds the
- * device. Requesting AUDIOFOCUS_GAIN with USAGE_VOICE_COMMUNICATION and setting
- * MODE_IN_COMMUNICATION is how a native calling app takes it instead of asking.
+ * Setting MODE_IN_COMMUNICATION before getUserMedia makes Android refuse the WebView's
+ * own AudioRecord with NotReadableError. The shell waits until the page is publishing,
+ * then takes audio focus so the call keeps the mic against other apps.
  *
  * iOS needs nothing here — `startKeepAlive` already configures AVAudioSession.
  */
